@@ -9,6 +9,8 @@ import com.orderservice.model.Order;
 import com.orderservice.model.OrderLineItems;
 import com.orderservice.repository.OrderRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cloud.sleuth.Span;
+import org.springframework.cloud.sleuth.Tracer;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -25,6 +27,8 @@ public class OrderService {
 
     private final OrderRepository orderRepository;
     private final WebClient.Builder webClientBuilder;
+
+    private final Tracer tracer;
     public String placeOrder(OrderRequest orderRequest) {
         Order order = new Order();
         order.setOrderNumber(UUID.randomUUID().toString());
@@ -55,31 +59,35 @@ public class OrderService {
         }
 
         //call InventoryService, and place order if product is in stock
+        Span inventoryServiceLookup = tracer.currentSpan().name("InventoryServiceLookup");
 
-        InventoryResponse[] inventoryResponseArray = webClientBuilder.build().get()
-                 .uri("http://inventory-service/api/inventory",
-                         uriBuilder -> uriBuilder.queryParam("skuCode",skuCodes).build())
-                 .retrieve()
-                 .bodyToMono(InventoryResponse[].class)
-                 .block();
-
+        try(Tracer.SpanInScope spanInScope =  tracer.withSpan(inventoryServiceLookup.start())){
+            InventoryResponse[] inventoryResponseArray = webClientBuilder.build().get()
+                    .uri("http://inventory-service/api/inventory",
+                            uriBuilder -> uriBuilder.queryParam("skuCode",skuCodes).build())
+                    .retrieve()
+                    .bodyToMono(InventoryResponse[].class)
+                    .block();
         /*boolean allProductsInStock = Arrays.stream(inventoryResponseArray)
                 .allMatch(InventoryResponse::isInStock);     */
-
-        boolean allProductsInStock = true;
-        for (InventoryResponse response : inventoryResponseArray) {
-            if (!response.isInStock()) {
-                allProductsInStock = false;
-                break;
+            boolean allProductsInStock = true;
+            for (InventoryResponse response : inventoryResponseArray) {
+                if (!response.isInStock()) {
+                    allProductsInStock = false;
+                    break;
+                }
             }
+
+            if(allProductsInStock){
+                orderRepository.save(order);
+                return "Order place succesfully!";
+            }else {
+                throw new IllegalArgumentException("product is not in stock, please try again later");
+            }
+        }finally{
+            inventoryServiceLookup.end();
         }
 
-        if(allProductsInStock){
-            orderRepository.save(order);
-            return "Order place succesfully!";
-        }else {
-            throw new IllegalArgumentException("product is not in stock, please try again later");
-        }
     }
 
     private OrderLineItems mapToDto(OrderLineItemsDto orderLineItemsDto) {
